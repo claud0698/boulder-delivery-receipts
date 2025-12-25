@@ -1,0 +1,30 @@
+# Docker Compose for local development
+version: '3.8'
+
+services:
+  expense-tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GOOGLE_SHEETS_ID=${GOOGLE_SHEETS_ID}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service_account.json
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - PORT=8080
+    volumes:
+      - ./src:/app/src  # Mount source for hot reload
+      - ./credentials:/app/credentials:ro  # Mount credentials as read-only
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
