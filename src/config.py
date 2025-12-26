@@ -12,8 +12,9 @@ class Settings(BaseSettings):
     # Telegram Bot
     telegram_bot_token: str
 
-    # Google Gemini API
-    gemini_api_key: str
+    # Google Cloud Platform - Vertex AI
+    gcp_project_id: str
+    gcp_location: str = "us-central1"  # Default Vertex AI location
 
     # Google Sheets
     google_sheets_id: str

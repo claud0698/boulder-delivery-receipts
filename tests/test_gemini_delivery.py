@@ -30,7 +30,7 @@ def test_gemini_extraction():
         image_bytes = f.read()
 
     # Extract receipt data
-    receipt_data, confidence = client.extract_receipt_data(image_bytes)
+    receipt_data, confidence, token_usage = client.extract_receipt_data(image_bytes)
 
     if receipt_data:
         logger.success("✓ Successfully extracted delivery receipt data!")
@@ -43,6 +43,13 @@ def test_gemini_extraction():
         logger.info(f"Empty Weight: {receipt_data.empty_weight} tons")
         logger.info(f"Net Weight: {receipt_data.net_weight} tons")
         logger.info(f"Confidence: {confidence:.2%}")
+
+        # Display token usage
+        if token_usage:
+            logger.info(f"Token Usage:")
+            logger.info(f"  - Input Tokens: {token_usage.get('prompt_token_count', 0)}")
+            logger.info(f"  - Output Tokens: {token_usage.get('candidates_token_count', 0)}")
+            logger.info(f"  - Total Tokens: {token_usage.get('total_token_count', 0)}")
 
         # Test material categorization
         material_type = client.categorize_material(receipt_data.material_name)

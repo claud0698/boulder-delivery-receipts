@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.llm.gemini_client import GeminiClient
 from src.storage.sheets_client import SheetsClient
-from src.models.delivery import DeliveryRecord
+from src.models.delivery import DeliveryRecord, TokenUsageRecord
 from loguru import logger
 
 
@@ -38,7 +38,7 @@ def test_full_pipeline():
 
     # Extract data with Gemini
     logger.info("\n[3/5] Extracting data with Gemini Vision API...")
-    receipt_data, confidence = gemini_client.extract_receipt_data(image_bytes)
+    receipt_data, confidence, token_usage = gemini_client.extract_receipt_data(image_bytes)
 
     if not receipt_data:
         logger.error("✗ Failed to extract receipt data")
@@ -50,14 +50,37 @@ def test_full_pipeline():
     logger.info(f"  Net Weight: {receipt_data.net_weight} tons")
     logger.info(f"  Confidence: {confidence:.2%}")
 
+    # Display token usage
+    if token_usage:
+        logger.info(f"  Token Usage: {token_usage.get('total_token_count', 0)} tokens")
+
     # Categorize material
     material_type = gemini_client.categorize_material(receipt_data.material_name)
     logger.info(f"  Material Type: {material_type}")
 
+    # Log token usage to sheets
+    if token_usage:
+        logger.info("\n[3.5/5] Logging token usage to Google Sheets...")
+        token_record = TokenUsageRecord(
+            receipt_number=receipt_data.receipt_number,
+            operation="extraction",
+            model="gemini-2.5-flash-lite",
+            prompt_tokens=token_usage.get('prompt_token_count', 0),
+            output_tokens=token_usage.get('candidates_token_count', 0),
+            total_tokens=token_usage.get('total_token_count', 0)
+        )
+        try:
+            if sheets_client.append_token_usage(token_record):
+                logger.success("✓ Token usage logged")
+            else:
+                logger.warning("⚠ Token usage logging failed (continuing...)")
+        except Exception as e:
+            logger.warning(f"⚠ Token usage logging error: {e} (continuing...)")
+
     # Upload to Google Cloud Storage
     logger.info("\n[4/5] Uploading receipt image to Google Cloud Storage...")
     try:
-        receipt_url = sheets_client.upload_image_to_storage(
+        receipt_url, gcs_uri = sheets_client.upload_image_to_storage(
             image_path=str(sample_path),
             receipt_number=receipt_data.receipt_number,
             weighing_datetime=receipt_data.weighing_datetime
@@ -65,14 +88,17 @@ def test_full_pipeline():
 
         if receipt_url:
             logger.success(f"✓ Image uploaded to GCS")
-            logger.info(f"  URL: {receipt_url}")
+            logger.info(f"  Public URL: {receipt_url}")
+            logger.info(f"  GCS URI: {gcs_uri}")
         else:
             logger.warning("⚠ GCS upload returned empty URL (continuing...)")
             receipt_url = ""
+            gcs_uri = ""
 
     except Exception as e:
         logger.error(f"✗ GCS upload failed: {e}")
         receipt_url = ""
+        gcs_uri = ""
 
     # Create delivery record
     logger.info("\n[5/5] Saving to Google Sheets...")

@@ -1,5 +1,6 @@
 # Use official Python runtime
-FROM python:3.11-slim
+# Explicitly use AMD64 for Cloud Run compatibility
+FROM --platform=linux/amd64 python:3.12-slim
 
 # Set working directory
 WORKDIR /app
@@ -31,12 +32,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:$PORT/health')" || exit 1
 
 # Run with Gunicorn for production
-CMD exec gunicorn \
-  --bind :$PORT \
-  --workers 1 \
-  --threads 8 \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --timeout 60 \
-  --access-logfile - \
-  --error-logfile - \
-  src.main:app
+# Timeout set to 300s (5 min) to handle long OCR processing and network delays
+# Using 1 worker with NO THREADS - async event loop handles concurrency
+# UvicornWorker handles async natively, threads cause SSL/segfault issues
+CMD ["sh", "-c", "exec gunicorn --bind :$PORT --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 300 --graceful-timeout 30 --keep-alive 75 --worker-tmp-dir /dev/shm --access-logfile - --error-logfile - --log-level info src.main:app"]

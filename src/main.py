@@ -1,9 +1,9 @@
 """Main FastAPI application for expense tracker bot."""
 
 import sys
-import os
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from telegram import Update
 from loguru import logger
 
@@ -15,13 +15,21 @@ from .messaging.telegram_handler import TelegramHandler
 logger.remove()
 logger.add(
     sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan> - "
+        "<level>{message}</level>"
+    ),
     level=settings.log_level
 )
 
 
 # Global telegram handler
 telegram_handler: TelegramHandler = None
+
+# Track background tasks to prevent them from being garbage collected
+background_tasks: set = set()
 
 
 @asynccontextmanager
@@ -49,13 +57,23 @@ async def lifespan(app: FastAPI):
         webhook_url = f"{settings.webhook_url}/webhook"
         logger.info(f"Setting webhook to: {webhook_url}")
 
-        await telegram_app.bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=["message", "edited_message"]
-        )
+        try:
+            await telegram_app.bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=[
+                    "message", "edited_message", "callback_query"
+                ],
+                max_connections=5,  # Limit connections for stability
+                drop_pending_updates=False  # Keep pending updates
+            )
 
-        webhook_info = await telegram_app.bot.get_webhook_info()
-        logger.info(f"Webhook info: {webhook_info}")
+            webhook_info = await telegram_app.bot.get_webhook_info()
+            logger.info(f"Webhook info: {webhook_info}")
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {e}")
+            logger.warning(
+                "Bot may not receive updates until webhook is configured"
+            )
     else:
         logger.info("Development mode - webhook not set")
 
@@ -69,6 +87,26 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down bot...")
+
+    # Wait for background tasks to complete (with timeout)
+    # Timeout should be less than Cloud Run's 300s timeout
+    # to allow graceful shutdown before force termination
+    if background_tasks:
+        logger.info(
+            f"Waiting for {len(background_tasks)} background tasks "
+            "to complete..."
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*background_tasks, return_exceptions=True),
+                timeout=120.0  # 2min - well within Cloud Run's 5min timeout
+            )
+            logger.info("All background tasks completed")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Background tasks did not complete in time, forcing shutdown"
+            )
+
     await telegram_app.shutdown()
     logger.info("Bot shut down complete")
 
@@ -107,6 +145,7 @@ async def telegram_webhook(request: Request):
     Webhook endpoint for Telegram updates.
 
     Telegram POSTs updates here when users send messages.
+    Returns 200 immediately and processes in background.
     """
     try:
         # Get update data
@@ -117,14 +156,22 @@ async def telegram_webhook(request: Request):
         telegram_app = request.app.state.telegram_app
         update = Update.de_json(data, telegram_app.bot)
 
-        # Process the update
-        await telegram_app.process_update(update)
+        # Create background task and track it
+        task = asyncio.create_task(telegram_app.process_update(update))
 
+        # Track the task to prevent garbage collection
+        background_tasks.add(task)
+
+        # Remove task from set when done (cleanup)
+        task.add_done_callback(lambda t: background_tasks.discard(t))
+
+        # Return 200 immediately
         return {"ok": True}
 
     except Exception as e:
         logger.error(f"Error processing webhook: {e}", exc_info=True)
-        return Response(status_code=500)
+        # Return 200 anyway to prevent Telegram from retrying
+        return {"ok": True}
 
 
 @app.get("/set_webhook")
@@ -200,7 +247,6 @@ async def run_polling():
 
 
 if __name__ == "__main__":
-    import asyncio
     import argparse
 
     parser = argparse.ArgumentParser(description="Expense Tracker Bot")

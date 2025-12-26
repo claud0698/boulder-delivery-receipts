@@ -2,7 +2,11 @@
 
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, field_validator
+
+# Jakarta timezone (UTC+7)
+JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
 
 class DeliveryReceiptData(BaseModel):
@@ -17,6 +21,7 @@ class DeliveryReceiptData(BaseModel):
     empty_weight: float = Field(..., ge=0, description="BERAT KOSONG - Empty vehicle weight in tons")
     net_weight: float = Field(..., gt=0, description="BERAT BERSIH - Net material weight in tons")
     confidence_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    material_type: str = Field(default="Lainnya", description="Categorized material type")
 
     @field_validator("weighing_datetime")
     @classmethod
@@ -40,7 +45,7 @@ class DeliveryReceiptData(BaseModel):
 class DeliveryRecord(BaseModel):
     """Complete delivery record for Google Sheets."""
 
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(JAKARTA_TZ))
     receipt_number: str = Field(..., min_length=1)
     weighing_datetime: str = Field(..., description="Weighing date and time")
     scale_number: str = Field(..., min_length=1)
@@ -59,19 +64,28 @@ class DeliveryRecord(BaseModel):
     def from_receipt_data(
         cls,
         receipt: DeliveryReceiptData,
-        material_type: str = "Other",
+        material_type: Optional[str] = None,
         confidence: float = 1.0,
         receipt_url: str = "",
         notes: str = ""
     ) -> "DeliveryRecord":
-        """Create DeliveryRecord from DeliveryReceiptData."""
+        """Create DeliveryRecord from DeliveryReceiptData.
+
+        Args:
+            receipt: Extracted receipt data
+            material_type: Optional override for material type.
+                          If not provided, uses receipt.material_type
+            confidence: Confidence score
+            receipt_url: URL to receipt image
+            notes: Additional notes
+        """
         return cls(
             receipt_number=receipt.receipt_number,
             weighing_datetime=receipt.weighing_datetime,
             scale_number=receipt.scale_number,
             vehicle_number=receipt.vehicle_number,
             material_name=receipt.material_name,
-            material_type=material_type,
+            material_type=material_type or receipt.material_type,
             gross_weight=receipt.gross_weight,
             empty_weight=receipt.empty_weight,
             net_weight=receipt.net_weight,
@@ -108,6 +122,35 @@ class DeliveryRecord(BaseModel):
             self.notes,
             self.receipt_url,
             self.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        ]
+
+
+class TokenUsageRecord(BaseModel):
+    """Token usage record for Gemini API calls."""
+
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(JAKARTA_TZ))
+    receipt_number: str = Field(default="", description="Associated receipt number")
+    operation: str = Field(..., description="Operation type: extraction or categorization")
+    model: str = Field(default="gemini-2.5-flash-lite")
+    prompt_tokens: int = Field(default=0, description="Input tokens")
+    output_tokens: int = Field(default=0, description="Output tokens")
+    total_tokens: int = Field(default=0, description="Total tokens used")
+
+    def to_sheets_row(self):
+        """Convert to Google Sheets row format.
+
+        Column order: No, Timestamp, Receipt #, Operation, Model,
+                     Input Tokens, Output Tokens, Total Tokens
+        """
+        return [
+            "",  # No - auto-generated or read from sheet
+            self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            self.receipt_number,
+            self.operation,
+            self.model,
+            self.prompt_tokens,
+            self.output_tokens,
+            self.total_tokens
         ]
 
 

@@ -39,16 +39,17 @@ def test_storage_upload():
     date_str = weighing_datetime.split()[0]
 
     try:
-        url = client.upload_image_to_storage(
+        public_url, gcs_uri = client.upload_image_to_storage(
             image_path=str(sample_path),
             receipt_number=receipt_number,
             weighing_datetime=weighing_datetime
         )
 
-        if url:
+        if public_url:
             logger.success("\n✓ Image uploaded successfully!")
             logger.info(f"Filename: {date_str}_{receipt_number}.jpg")
-            logger.info(f"Public URL: {url}")
+            logger.info(f"Public URL: {public_url}")
+            logger.info(f"GCS URI: {gcs_uri}")
             return True
         else:
             logger.error("✗ Upload returned empty URL")

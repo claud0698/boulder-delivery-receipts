@@ -17,7 +17,7 @@ import os
 from ..config import settings
 from ..llm.gemini_client import GeminiClient
 from ..storage.sheets_client import SheetsClient
-from ..models.delivery import DeliveryRecord
+from ..models.delivery import DeliveryRecord, TokenUsageRecord
 
 
 class TelegramHandler:
@@ -68,10 +68,6 @@ Fitur yang tersedia:
 
     async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /menu command - show main menu with quick action buttons."""
-        # Check auto-save status
-        auto_save = context.user_data.get("auto_save_enabled", False)
-        auto_save_status = "🟢 ON" if auto_save else "🔴 OFF"
-
         keyboard = [
             [
                 InlineKeyboardButton("📸 Upload Bukti", callback_data="menu_upload"),
@@ -80,23 +76,11 @@ Fitur yang tersedia:
             [
                 InlineKeyboardButton("📈 Total Hari Ini", callback_data="menu_total"),
                 InlineKeyboardButton("ℹ️ Bantuan", callback_data="menu_help")
-            ],
-            [
-                InlineKeyboardButton(
-                    f"⚡ Auto-Save: {auto_save_status}",
-                    callback_data="toggle_autosave"
-                )
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        auto_save_desc = (
-            "_(Otomatis simpan tanpa konfirmasi)_"
-            if auto_save
-            else "_(Perlu konfirmasi sebelum simpan)_"
-        )
-
-        menu_message = f"""
+        menu_message = """
 🏠 *Menu Utama - Bot Tracking Pengiriman*
 
 Pilih salah satu opsi di bawah ini atau gunakan perintah langsung:
@@ -105,9 +89,6 @@ Pilih salah satu opsi di bawah ini atau gunakan perintah langsung:
 📊 Lihat 5 Pengiriman Terbaru
 📈 Total Berat Bersih Hari Ini
 ℹ️ Bantuan & Info
-
-⚡ *Auto-Save:* {auto_save_status}
-{auto_save_desc}
 
 Atau langsung kirim foto bukti penimbangan! 📷
         """
@@ -369,22 +350,11 @@ Saya akan mengekstrak detailnya dan menyimpan data pengiriman secara otomatis.
         update: Update,
         context: ContextTypes.DEFAULT_TYPE
     ):
-        """Handle delivery receipt photo uploads - automatically processes any image."""
+        """Handle delivery receipt photo uploads - single or media group."""
         try:
-            # Check if there's already pending data
-            if context.user_data.get("pending_receipt"):
-                await update.message.reply_text(
-                    "⚠️ Anda masih memiliki pengiriman yang belum "
-                    "disetujui!\n\n"
-                    "Silakan setujui atau tolak pengiriman sebelumnya "
-                    "terlebih dahulu, atau kirim foto ini lagi setelah "
-                    "menyelesaikan yang sebelumnya."
-                )
-                return
-
+            # Acknowledge receipt immediately
             await update.message.reply_text(
-                "📸 Bukti penimbangan diterima! Memproses... "
-                "Ini mungkin memakan waktu beberapa detik."
+                "📸 Foto diterima! Memproses..."
             )
 
             # Get the highest quality photo
@@ -395,140 +365,326 @@ Saya akan mengekstrak detailnya dan menyimpan data pengiriman secara otomatis.
             image_bytes = await photo_file.download_as_bytearray()
             image_bytes = bytes(image_bytes)
 
-            # Save to temp file for later upload to Drive
+            # Save to temp file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
             temp_file.write(image_bytes)
             temp_file_path = temp_file.name
             temp_file.close()
 
             logger.info(
-                f"Processing delivery receipt for user {update.effective_user.id}"
+                f"Processing image for user {update.effective_user.id}"
             )
 
-            # Extract receipt data and categorize material in parallel (async)
-            # Run blocking Gemini calls in thread pool to avoid blocking event loop
-            extraction_task = asyncio.to_thread(
-                self.gemini_client.extract_receipt_data,
-                image_bytes
-            )
-
-            # Start extraction first
-            receipt_data, confidence = await extraction_task
-
-            if receipt_data is None:
-                await update.message.reply_text(
-                    "❌ Maaf, saya tidak dapat mengekstrak data dari bukti ini. "
-                    "Pastikan foto jelas dan coba lagi."
+            # Process single image in background
+            asyncio.create_task(
+                self._process_single_image(
+                    chat_id=update.effective_chat.id,
+                    temp_file_path=temp_file_path,
+                    context=context
                 )
-                os.unlink(temp_file_path)  # Clean up temp file
-                return
-
-            # Check confidence threshold - reject low-quality extractions early
-            if confidence < settings.min_confidence_threshold:
-                await update.message.reply_text(
-                    f"⚠️ *Kualitas ekstraksi terlalu rendah* ({confidence * 100:.0f}%)\n\n"
-                    "Data yang diekstrak mungkin tidak akurat. "
-                    "Silakan coba lagi dengan foto yang lebih jelas:\n\n"
-                    "✅ Pastikan pencahayaan baik\n"
-                    "✅ Fokus kamera tajam\n"
-                    "✅ Seluruh teks terlihat jelas\n"
-                    "✅ Tidak ada bayangan atau silau",
-                    parse_mode="Markdown"
-                )
-                os.unlink(temp_file_path)  # Clean up temp file
-                logger.warning(
-                    f"Rejected extraction due to low confidence: {confidence:.2f} "
-                    f"(threshold: {settings.min_confidence_threshold})"
-                )
-                return
-
-            # Categorize the material (also run in thread pool)
-            material_type = await asyncio.to_thread(
-                self.gemini_client.categorize_material,
-                receipt_data.material_name
-            )
-
-            # Check if auto-save mode is enabled
-            auto_save_enabled = context.user_data.get("auto_save_enabled", False)
-
-            if auto_save_enabled:
-                # Auto-save mode: Save directly without confirmation
-                await self._save_delivery_directly(
-                    update,
-                    context,
-                    receipt_data,
-                    material_type,
-                    confidence,
-                    temp_file_path
-                )
-                return
-
-            # Store data in user context for approval
-            context.user_data["pending_receipt"] = receipt_data
-            context.user_data["pending_material_type"] = material_type
-            context.user_data["pending_confidence"] = confidence
-            context.user_data["pending_image_path"] = temp_file_path
-
-            # Create inline keyboard for approval
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "✅ Setuju & Simpan",
-                        callback_data="approve_delivery"
-                    ),
-                    InlineKeyboardButton(
-                        "✏️ Edit Data",
-                        callback_data="edit_delivery"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Tolak",
-                        callback_data="reject_delivery"
-                    )
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Send confirmation request
-            confirmation = f"""
-📋 *Silakan periksa data yang diekstrak:*
-
-• *No Nota:* {receipt_data.receipt_number}
-• *Waktu Timbang:* {receipt_data.weighing_datetime}
-• *No Timbangan:* {receipt_data.scale_number}
-• *No Kendaraan:* {receipt_data.vehicle_number}
-• *Material:* {receipt_data.material_name}
-• *Jenis:* {material_type}
-• *Berat Isi:* {receipt_data.gross_weight} ton
-• *Berat Kosong:* {receipt_data.empty_weight} ton
-• *Berat Bersih:* {receipt_data.net_weight} ton
-• *Confidence:* {confidence * 100:.0f}%
-
-Apakah informasi ini benar?
-            """
-            await update.message.reply_text(
-                confirmation.strip(),
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-
-            logger.info(
-                f"Awaiting approval for delivery: {receipt_data.receipt_number} "
-                f"from user {update.effective_user.id}"
             )
 
         except Exception as e:
-            logger.error(f"Error processing photo: {e}", exc_info=True)
+            logger.error(f"Error handling photo: {e}", exc_info=True)
             await update.message.reply_text(
-                "❌ Terjadi kesalahan saat memproses bukti Anda. "
-                "Silakan coba lagi atau hubungi dukungan."
+                "❌ Terjadi kesalahan saat menerima foto. "
+                "Silakan coba lagi."
             )
-            # Clean up temp file if it exists
-            if 'temp_file_path' in locals():
+
+    async def _process_single_image(
+        self,
+        chat_id: int,
+        temp_file_path: str,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Process single image: upload to GCS, extract data, save to Sheets."""
+        try:
+            logger.info(f"Processing single image for chat {chat_id}")
+
+            # Step 1: Upload to GCS first to get URI
+            import time
+            temp_receipt_id = f"temp_{int(time.time())}_{chat_id}"
+            temp_datetime = time.strftime("%Y-%m-%d %H:%M:%S")
+
+            receipt_url, gcs_uri = await asyncio.to_thread(
+                self.sheets_client.upload_image_to_storage,
+                image_path=temp_file_path,
+                receipt_number=temp_receipt_id,
+                weighing_datetime=temp_datetime
+            )
+            logger.info(f"Image uploaded to GCS: {gcs_uri}")
+
+            # Step 2: Extract receipt data using GCS URI
+            receipt_data, confidence, token_usage = await asyncio.to_thread(
+                self.gemini_client.extract_receipt_data,
+                gcs_uri=gcs_uri
+            )
+
+            # Log token usage
+            if token_usage:
+                logger.info(
+                    f"Token usage: {token_usage.get('total_token_count', 0)} "
+                    f"tokens (prompt: {token_usage.get('prompt_token_count', 0)}, "
+                    f"output: {token_usage.get('candidates_token_count', 0)})"
+                )
+
+            if receipt_data is None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Tidak dapat mengekstrak data dari bukti. "
+                    "Pastikan foto jelas."
+                )
+                os.unlink(temp_file_path)
+                return
+
+            # Log token usage to Sheets (non-blocking)
+            if token_usage:
+                try:
+                    token_record = TokenUsageRecord(
+                        receipt_number=receipt_data.receipt_number,
+                        operation="extraction",
+                        model="gemini-2.5-flash-lite",
+                        prompt_tokens=token_usage.get('prompt_token_count', 0),
+                        output_tokens=token_usage.get(
+                            'candidates_token_count', 0
+                        ),
+                        total_tokens=token_usage.get('total_token_count', 0)
+                    )
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            self.sheets_client.append_token_usage,
+                            token_record
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Token usage logging failed: {e}")
+
+            # Step 3: Create delivery record (material_type now in receipt_data)
+            delivery = DeliveryRecord.from_receipt_data(
+                receipt=receipt_data,
+                confidence=confidence,
+                receipt_url=receipt_url,
+                notes=""
+            )
+            logger.info(f"Material categorized as: {delivery.material_type}")
+
+            # Step 4: Save to Google Sheets
+            success = await asyncio.to_thread(
+                self.sheets_client.append_delivery,
+                delivery
+            )
+
+            # Clean up temp file
+            try:
+                os.unlink(temp_file_path)
+            except Exception:
+                pass
+
+            # Step 5: Notify user
+            if success:
+                message = f"""
+✅ *Tersimpan!*
+
+• *No Nota:* {receipt_data.receipt_number}
+• *Material:* {receipt_data.material_name}
+• *Berat Bersih:* {receipt_data.net_weight} ton
+• *Kendaraan:* {receipt_data.vehicle_number}
+
+Data sudah masuk ke Google Sheets.
+                """
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message.strip(),
+                    parse_mode="Markdown"
+                )
+                logger.info(
+                    f"Saved delivery: {receipt_data.receipt_number}"
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Gagal menyimpan ke Google Sheets. "
+                    "Silakan coba lagi."
+                )
+
+        except Exception as e:
+            logger.error(f"Error processing single image: {e}", exc_info=True)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Terjadi kesalahan saat memproses. "
+                    "Silakan coba lagi."
+                )
+            except Exception:
+                pass
+            try:
+                os.unlink(temp_file_path)
+            except Exception:
+                pass
+
+    async def _process_multiple_images(
+        self,
+        chat_id: int,
+        temp_file_paths: list[str],
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Process multiple images: batch upload to GCS, extract, save."""
+        try:
+            import time
+            logger.info(
+                f"Processing {len(temp_file_paths)} images for chat {chat_id}"
+            )
+
+            # Step 1: Prepare data for batch upload
+            temp_datetime = time.strftime("%Y-%m-%d %H:%M:%S")
+            receipt_numbers = [
+                f"temp_{int(time.time())}_{chat_id}_{i}"
+                for i in range(len(temp_file_paths))
+            ]
+            weighing_datetimes = [temp_datetime] * len(temp_file_paths)
+
+            # Step 2: Upload all images to GCS concurrently
+            upload_results = await asyncio.to_thread(
+                self.sheets_client.batch_upload_images_to_storage,
+                image_paths=temp_file_paths,
+                receipt_numbers=receipt_numbers,
+                weighing_datetimes=weighing_datetimes
+            )
+            logger.info(f"Batch uploaded {len(upload_results)} images to GCS")
+
+            # Step 3: Process each image sequentially with Gemini
+            deliveries = []
+            successful_count = 0
+            total_weight = 0.0
+
+            for i, (temp_file_path, (receipt_url, gcs_uri)) in enumerate(
+                zip(temp_file_paths, upload_results)
+            ):
+                try:
+                    # Extract receipt data using GCS URI
+                    receipt_data, confidence, token_usage = (
+                        await asyncio.to_thread(
+                            self.gemini_client.extract_receipt_data,
+                            gcs_uri=gcs_uri
+                        )
+                    )
+
+                    if receipt_data is None:
+                        logger.warning(f"Failed to extract data from image {i+1}")
+                        continue
+
+                    # Log token usage (non-blocking)
+                    if token_usage:
+                        try:
+                            token_record = TokenUsageRecord(
+                                receipt_number=receipt_data.receipt_number,
+                                operation="extraction",
+                                model="gemini-2.5-flash-lite",
+                                prompt_tokens=token_usage.get(
+                                    'prompt_token_count', 0
+                                ),
+                                output_tokens=token_usage.get(
+                                    'candidates_token_count', 0
+                                ),
+                                total_tokens=token_usage.get(
+                                    'total_token_count', 0
+                                )
+                            )
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    self.sheets_client.append_token_usage,
+                                    token_record
+                                )
+                            )
+                        except Exception as e:
+                            logger.warning(f"Token usage logging failed: {e}")
+
+                    # Create delivery record (material_type now in receipt_data)
+                    delivery = DeliveryRecord.from_receipt_data(
+                        receipt=receipt_data,
+                        confidence=confidence,
+                        receipt_url=receipt_url,
+                        notes=""
+                    )
+                    deliveries.append(delivery)
+                    successful_count += 1
+                    total_weight += receipt_data.net_weight
+
+                    logger.info(
+                        f"Processed image {i+1}/{len(temp_file_paths)}: "
+                        f"{receipt_data.receipt_number}"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Error processing image {i+1}: {e}")
+                    continue
+
+            # Step 4: Batch save all deliveries to Sheets
+            if deliveries:
+                success = await asyncio.to_thread(
+                    self.sheets_client.batch_append_deliveries,
+                    deliveries
+                )
+            else:
+                success = False
+
+            # Clean up temp files
+            for temp_file_path in temp_file_paths:
                 try:
                     os.unlink(temp_file_path)
-                except:
+                except Exception:
+                    pass
+
+            # Step 5: Send summary message
+            if success and deliveries:
+                summary_lines = []
+                for delivery in deliveries:
+                    summary_lines.append(
+                        f"• {delivery.receipt_number}: "
+                        f"{delivery.net_weight}t"
+                    )
+
+                message = f"""
+✅ *{successful_count} Pengiriman Tersimpan!*
+
+{chr(10).join(summary_lines)}
+
+*Total Berat Bersih:* {total_weight:.2f} ton
+
+Data sudah masuk ke Google Sheets.
+                """
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message.strip(),
+                    parse_mode="Markdown"
+                )
+                logger.info(
+                    f"Saved {successful_count} deliveries from batch"
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Gagal memproses {len(temp_file_paths)} foto. "
+                    "Silakan coba lagi."
+                )
+
+        except Exception as e:
+            logger.error(
+                f"Error processing multiple images: {e}", exc_info=True
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Terjadi kesalahan saat memproses foto. "
+                    "Silakan coba lagi."
+                )
+            except Exception:
+                pass
+            # Clean up temp files
+            for temp_file_path in temp_file_paths:
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
                     pass
 
     async def handle_callback(
@@ -563,15 +719,6 @@ Apakah informasi ini benar?
             await self.menu_total_action(update, context)
         elif query.data == "menu_help":
             await self.menu_help_action(update, context)
-        elif query.data == "toggle_autosave":
-            await self.toggle_autosave(update, context)
-        # Delivery approval callbacks
-        elif query.data == "approve_delivery":
-            await self.approve_delivery(update, context)
-        elif query.data == "reject_delivery":
-            await self.reject_delivery(update, context)
-        elif query.data == "edit_delivery":
-            await self.edit_delivery(update, context)
 
     async def show_menu_inline(
         self,
@@ -803,301 +950,12 @@ Saya akan mengekstrak detailnya dan menyimpan data pengiriman secara otomatis.
             parse_mode="Markdown"
         )
 
-    async def toggle_autosave(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE
-    ):
-        """Toggle auto-save mode."""
-        current_status = context.user_data.get("auto_save_enabled", False)
-        new_status = not current_status
-        context.user_data["auto_save_enabled"] = new_status
-
-        status_text = "🟢 AKTIF" if new_status else "🔴 NONAKTIF"
-        mode_desc = (
-            "Foto akan otomatis disimpan tanpa konfirmasi.\n"
-            "Cocok untuk upload banyak foto sekaligus!"
-            if new_status
-            else "Setiap foto perlu konfirmasi sebelum disimpan.\n"
-            "Mode yang lebih aman untuk memastikan data akurat."
-        )
-
-        await update.callback_query.message.reply_text(
-            f"⚡ *Auto-Save Mode: {status_text}*\n\n{mode_desc}",
-            parse_mode="Markdown"
-        )
-
-        logger.info(
-            f"User {update.effective_user.id} toggled auto-save to {new_status}"
-        )
-
-    async def _save_delivery_directly(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        receipt_data,
-        material_type: str,
-        confidence: float,
-        temp_image_path: str
-    ):
-        """Save delivery directly without user confirmation (auto-save mode)."""
-        try:
-            await update.message.reply_text(
-                "💾 Auto-save: Menyimpan data pengiriman..."
-            )
-
-            # Upload image to Cloud Storage
-            receipt_url = ""
-            try:
-                if temp_image_path and os.path.exists(temp_image_path):
-                    receipt_url = await asyncio.to_thread(
-                        self.sheets_client.upload_image_to_storage,
-                        image_path=temp_image_path,
-                        receipt_number=receipt_data.receipt_number,
-                        weighing_datetime=receipt_data.weighing_datetime
-                    )
-                    logger.info(f"Image uploaded to Cloud Storage: {receipt_url}")
-            except Exception as e:
-                logger.error(f"Failed to upload to Cloud Storage: {e}")
-
-            # Create delivery record
-            delivery = DeliveryRecord.from_receipt_data(
-                receipt=receipt_data,
-                material_type=material_type,
-                confidence=confidence,
-                receipt_url=receipt_url,
-                notes="Auto-saved"
-            )
-
-            # Save to Google Sheets
-            success = await asyncio.to_thread(
-                self.sheets_client.append_delivery,
-                delivery
-            )
-
-            if success:
-                success_message = f"""
-✅ *Auto-saved!*
-
-• *No Nota:* {receipt_data.receipt_number}
-• *Material:* {receipt_data.material_name}
-• *Berat Bersih:* {receipt_data.net_weight} ton
-• *Kendaraan:* {receipt_data.vehicle_number}
-
-Kirim foto lagi untuk upload berikutnya! 📸
-                """
-                await update.message.reply_text(
-                    success_message.strip(),
-                    parse_mode="Markdown"
-                )
-                logger.info(
-                    f"Auto-saved delivery: {receipt_data.receipt_number} "
-                    f"for user {update.effective_user.id}"
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Gagal menyimpan data. Silakan coba lagi."
-                )
-
-        except Exception as e:
-            logger.error(f"Error in auto-save: {e}", exc_info=True)
-            await update.message.reply_text(
-                "❌ Terjadi kesalahan saat menyimpan data secara otomatis."
-            )
-        finally:
-            # Clean up temp file
-            if temp_image_path and os.path.exists(temp_image_path):
-                try:
-                    os.unlink(temp_image_path)
-                    logger.info(f"Cleaned up temp file: {temp_image_path}")
-                except Exception as e:
-                    logger.error(f"Failed to delete temp file: {e}")
-
-    async def approve_delivery(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE
-    ):
-        """Approve and save the delivery record."""
-        try:
-            receipt_data = context.user_data.get("pending_receipt")
-            material_type = context.user_data.get("pending_material_type")
-            confidence = context.user_data.get("pending_confidence")
-            temp_image_path = context.user_data.get("pending_image_path")
-
-            if not receipt_data:
-                await update.callback_query.message.reply_text(
-                    "❌ Data tidak ditemukan. Silakan upload ulang."
-                )
-                return
-
-            await update.callback_query.message.reply_text(
-                "💾 Menyimpan data pengiriman..."
-            )
-
-            # Upload image to Google Cloud Storage and save to Sheets in parallel
-            # Run both blocking I/O operations concurrently
-            receipt_url = ""
-
-            async def upload_image():
-                """Upload image to Cloud Storage."""
-                try:
-                    if temp_image_path and os.path.exists(temp_image_path):
-                        url = await asyncio.to_thread(
-                            self.sheets_client.upload_image_to_storage,
-                            image_path=temp_image_path,
-                            receipt_number=receipt_data.receipt_number,
-                            weighing_datetime=receipt_data.weighing_datetime
-                        )
-                        logger.info(f"Image uploaded to Cloud Storage: {url}")
-                        return url
-                except Exception as e:
-                    logger.error(f"Failed to upload to Cloud Storage: {e}")
-                return ""
-
-            # Start image upload first (can happen in background)
-            receipt_url = await upload_image()
-
-            # Create delivery record
-            delivery = DeliveryRecord.from_receipt_data(
-                receipt=receipt_data,
-                material_type=material_type,
-                confidence=confidence,
-                receipt_url=receipt_url,
-                notes=""
-            )
-
-            # Save to Google Sheets (run in thread pool)
-            success = await asyncio.to_thread(
-                self.sheets_client.append_delivery,
-                delivery
-            )
-
-            if success:
-                success_message = f"""
-✅ *Pengiriman berhasil disimpan!*
-
-• *No Nota:* {receipt_data.receipt_number}
-• *Material:* {receipt_data.material_name}
-• *Berat Bersih:* {receipt_data.net_weight} ton
-• *Kendaraan:* {receipt_data.vehicle_number}
-
-Data telah ditambahkan ke Google Sheets.
-                """
-                if receipt_url:
-                    success_message += f"\n[Lihat Bukti]({receipt_url})"
-
-                await update.callback_query.message.reply_text(
-                    success_message.strip(),
-                    parse_mode="Markdown"
-                )
-
-                logger.info(
-                    f"Delivery saved: {receipt_data.receipt_number} "
-                    f"for user {update.effective_user.id}"
-                )
-            else:
-                await update.callback_query.message.reply_text(
-                    "❌ Gagal menyimpan data. Silakan coba lagi."
-                )
-
-        except Exception as e:
-            logger.error(f"Error approving delivery: {e}", exc_info=True)
-            await update.callback_query.message.reply_text(
-                "❌ Terjadi kesalahan saat menyimpan data."
-            )
-        finally:
-            # Clean up temp file
-            temp_image_path = context.user_data.get("pending_image_path")
-            if temp_image_path and os.path.exists(temp_image_path):
-                try:
-                    os.unlink(temp_image_path)
-                    logger.info(f"Cleaned up temp file: {temp_image_path}")
-                except Exception as e:
-                    logger.error(f"Failed to delete temp file: {e}")
-
-            # Clear only pending data (not entire context) to allow multiple uploads
-            context.user_data.pop("pending_receipt", None)
-            context.user_data.pop("pending_material_type", None)
-            context.user_data.pop("pending_confidence", None)
-            context.user_data.pop("pending_image_path", None)
-            context.user_data.pop("edit_mode", None)
-
-    async def reject_delivery(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE
-    ):
-        """Reject the delivery record."""
-        # Clean up temp file
-        temp_image_path = context.user_data.get("pending_image_path")
-        if temp_image_path and os.path.exists(temp_image_path):
-            try:
-                os.unlink(temp_image_path)
-            except:
-                pass
-
-        # Clear only pending data (not entire context) to allow multiple uploads
-        context.user_data.pop("pending_receipt", None)
-        context.user_data.pop("pending_material_type", None)
-        context.user_data.pop("pending_confidence", None)
-        context.user_data.pop("pending_image_path", None)
-        context.user_data.pop("edit_mode", None)
-
-        await update.callback_query.message.reply_text(
-            "❌ Pengiriman dibatalkan. Kirim foto baru untuk upload lagi."
-        )
-
-    async def edit_delivery(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE
-    ):
-        """Start edit mode for delivery data."""
-        receipt_data = context.user_data.get("pending_receipt")
-
-        if not receipt_data:
-            await update.callback_query.message.reply_text(
-                "❌ Data tidak ditemukan. Silakan upload ulang."
-            )
-            return
-
-        # Set edit mode flag
-        context.user_data["edit_mode"] = True
-
-        edit_message = """
-✏️ *Mode Edit Data*
-
-Silakan kirim data yang ingin diubah dalam format:
-
-`field: nilai_baru`
-
-*Field yang bisa diubah:*
-• `no_nota` - Nomor nota
-• `kendaraan` - Nomor kendaraan
-• `material` - Nama material
-• `berat_isi` - Berat isi (ton)
-• `berat_kosong` - Berat kosong (ton)
-
-*Contoh:*
-`no_nota: 12345`
-`material: Batu Split`
-`berat_isi: 25.5`
-
-Kirim `selesai` jika sudah selesai edit.
-        """
-
-        await update.callback_query.message.reply_text(
-            edit_message.strip(),
-            parse_mode="Markdown"
-        )
-
     async def handle_text_message(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE
     ):
-        """Handle text messages for editing data or custom date input."""
+        """Handle text messages for custom date input."""
         text = update.message.text.strip()
 
         # Handle custom date input for /total
@@ -1124,132 +982,11 @@ Kirim `selesai` jika sudah selesai edit.
                 )
                 return
 
-        # Handle edit mode
-        if not context.user_data.get("edit_mode"):
-            # Not in edit mode, reject text messages
-            await update.message.reply_text(
-                "📋 Silakan gunakan menu untuk berinteraksi dengan bot.\n\n"
-                "Ketik /menu atau /start untuk melihat opsi yang tersedia."
-            )
-            return
-
-        # Check if user is done editing
-        if text.lower() == "selesai":
-            context.user_data["edit_mode"] = False
-            receipt_data = context.user_data.get("pending_receipt")
-
-            # Show updated data with approval buttons
-            material_type = context.user_data.get("pending_material_type")
-            confidence = context.user_data.get("pending_confidence")
-
-            # Recalculate net weight
-            receipt_data.net_weight = receipt_data.gross_weight - receipt_data.empty_weight
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "✅ Setuju & Simpan",
-                        callback_data="approve_delivery"
-                    ),
-                    InlineKeyboardButton(
-                        "✏️ Edit Lagi",
-                        callback_data="edit_delivery"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Tolak",
-                        callback_data="reject_delivery"
-                    )
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            confirmation = f"""
-📋 *Data yang sudah diedit:*
-
-• *No Nota:* {receipt_data.receipt_number}
-• *Waktu Timbang:* {receipt_data.weighing_datetime}
-• *No Timbangan:* {receipt_data.scale_number}
-• *No Kendaraan:* {receipt_data.vehicle_number}
-• *Material:* {receipt_data.material_name}
-• *Jenis:* {material_type}
-• *Berat Isi:* {receipt_data.gross_weight} ton
-• *Berat Kosong:* {receipt_data.empty_weight} ton
-• *Berat Bersih:* {receipt_data.net_weight} ton
-• *Confidence:* {confidence * 100:.0f}%
-
-Apakah informasi ini benar?
-            """
-            await update.message.reply_text(
-                confirmation.strip(),
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-            return
-
-        # Parse edit command (format: "field: value")
-        if ":" not in text:
-            await update.message.reply_text(
-                "❌ Format salah. Gunakan: `field: nilai`\nContoh: `no_nota: 12345`",
-                parse_mode="Markdown"
-            )
-            return
-
-        field, value = text.split(":", 1)
-        field = field.strip().lower()
-        value = value.strip()
-
-        receipt_data = context.user_data.get("pending_receipt")
-
-        try:
-            if field == "no_nota":
-                receipt_data.receipt_number = value
-                await update.message.reply_text(f"✅ No Nota diubah menjadi: {value}")
-            elif field == "kendaraan":
-                receipt_data.vehicle_number = value
-                await update.message.reply_text(f"✅ No Kendaraan diubah menjadi: {value}")
-            elif field == "material":
-                receipt_data.material_name = value
-                # Re-categorize material
-                material_type = self.gemini_client.categorize_material(value)
-                context.user_data["pending_material_type"] = material_type
-                await update.message.reply_text(
-                    f"✅ Material diubah menjadi: {value}\n"
-                    f"Kategori: {material_type}"
-                )
-            elif field == "berat_isi":
-                receipt_data.gross_weight = float(value)
-                receipt_data.net_weight = receipt_data.gross_weight - receipt_data.empty_weight
-                await update.message.reply_text(
-                    f"✅ Berat Isi diubah menjadi: {value} ton\n"
-                    f"Berat Bersih: {receipt_data.net_weight} ton"
-                )
-            elif field == "berat_kosong":
-                receipt_data.empty_weight = float(value)
-                receipt_data.net_weight = receipt_data.gross_weight - receipt_data.empty_weight
-                await update.message.reply_text(
-                    f"✅ Berat Kosong diubah menjadi: {value} ton\n"
-                    f"Berat Bersih: {receipt_data.net_weight} ton"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Field '{field}' tidak dikenal.\n"
-                    f"Field yang tersedia: no_nota, kendaraan, material, berat_isi, berat_kosong"
-                )
-                return
-
-            context.user_data["pending_receipt"] = receipt_data
-
-        except ValueError:
-            await update.message.reply_text(
-                f"❌ Nilai tidak valid untuk {field}. Pastikan format benar."
-            )
-        except Exception as e:
-            logger.error(f"Error editing field {field}: {e}")
-            await update.message.reply_text(
-                f"❌ Terjadi kesalahan saat mengubah {field}"
-            )
+        # For other text messages, guide user to menu
+        await update.message.reply_text(
+            "📋 Silakan gunakan menu untuk berinteraksi dengan bot.\n\n"
+            "Ketik /menu atau /start untuk melihat opsi yang tersedia."
+        )
 
     def setup_handlers(self, application: Application):
         """Set up all command and message handlers."""
@@ -1282,9 +1019,25 @@ Apakah informasi ini benar?
         Returns:
             Application: Configured Telegram application with all handlers registered.
         """
-        application = Application.builder().token(self.bot_token).build()
+        from telegram.request import HTTPXRequest
+
+        # Create custom request with longer timeouts for Cloud Run
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            connect_timeout=30.0,  # 30 seconds for connection
+            read_timeout=120.0,    # 2 minutes for read (handles slow networks)
+            write_timeout=30.0,    # 30 seconds for write
+            pool_timeout=10.0      # 10 seconds for getting connection from pool
+        )
+
+        application = (
+            Application.builder()
+            .token(self.bot_token)
+            .request(request)
+            .build()
+        )
         self.setup_handlers(application)
-        logger.info("Telegram application created and configured")
+        logger.info("Telegram application created with extended timeouts")
         return application
 
     def run_polling(self):

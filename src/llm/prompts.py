@@ -40,12 +40,17 @@ text if present (string)
 - empty_weight: BERAT KOSONG value in tons (number)
 - net_weight: BERAT BERSIH value in tons (number)
 - confidence_score: Your confidence in extraction accuracy 0.0-1.0 (number)
+- material_type: Categorize the material into one of these categories: \
+"Batu Pecah 1/2", "Batu Pecah 2/3", "Batu Pecah 3/5", "Batu Sungai", \
+"Boulder", "Kerikil", "Pasir", "Abu Batu", "Lainnya". Look for size patterns \
+like 1/2, 2/3, 3/5 in the material name. (string)
 
 Important constraints:
 - Convert datetime to YYYY-MM-DD HH:MM:SS format (24-hour format)
 - All weight values must be numerical (float), representing tons
 - Net weight should approximately equal gross_weight - empty_weight
 - Preserve material name exactly as shown, including special characters
+- Categorize material_type based on the extracted material_name
 - If you cannot clearly read a value, make your best guess but note lower \
 confidence score"""
 
@@ -87,6 +92,10 @@ RECEIPT_EXTRACTION_SCHEMA = {
         "confidence_score": {
             "type": "number",
             "description": "Extraction confidence level (0.0 to 1.0)"
+        },
+        "material_type": {
+            "type": "string",
+            "description": "Material category from predefined list"
         }
     },
     "required": [
@@ -98,21 +107,7 @@ RECEIPT_EXTRACTION_SCHEMA = {
         "gross_weight",
         "empty_weight",
         "net_weight",
-        "confidence_score"
+        "confidence_score",
+        "material_type"
     ]
 }
-
-
-CATEGORIZATION_SYSTEM_PROMPT = """You are a Material Type Categorization \
-specialist for boulder and construction materials. Your task is to analyze \
-the provided material name (which may be in Indonesian and/or Chinese) and \
-assign it to one category from the list. You must return ONLY the category \
-name in Indonesian. Common patterns: 'BATU PECAH' = crushed stone, look for \
-size like 1/2, 2/3, 3/5."""
-
-CATEGORIZATION_PROMPT = """Material: "{merchant}"
-
-Categories: Batu Pecah 1/2, Batu Pecah 2/3, Batu Pecah 3/5, Batu Sungai, \
-Boulder, Kerikil, Pasir, Abu Batu, Lainnya
-
-Return ONLY the category name (in Indonesian)."""
