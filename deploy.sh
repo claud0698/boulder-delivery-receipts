@@ -87,7 +87,8 @@ gcloud run deploy $SERVICE_NAME \
   --cpu-boost \
   --session-affinity \
   --set-secrets TELEGRAM_BOT_TOKEN=telegram-bot-token:latest \
-  --update-env-vars ENVIRONMENT=production,LOG_LEVEL=INFO,GOOGLE_SHEETS_ID=$GOOGLE_SHEETS_ID,GCS_BUCKET_NAME=$GCS_BUCKET_NAME,GCP_PROJECT_ID=$PROJECT_ID,GCP_LOCATION=us-central1
+  --update-env-vars ENVIRONMENT=production,LOG_LEVEL=INFO,GOOGLE_SHEETS_ID=$GOOGLE_SHEETS_ID,GCS_BUCKET_NAME=$GCS_BUCKET_NAME,GCP_PROJECT_ID=$PROJECT_ID,GCP_LOCATION=us-central1 \
+  --remove-env-vars GOOGLE_APPLICATION_CREDENTIALS
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}❌ Cloud Run deployment failed!${NC}"
