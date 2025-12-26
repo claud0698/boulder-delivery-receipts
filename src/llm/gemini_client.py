@@ -4,7 +4,6 @@ import json
 import os
 from typing import Optional, Tuple, Dict
 from io import BytesIO
-from functools import lru_cache
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
 from PIL import Image
@@ -25,12 +24,12 @@ class GeminiClient:
     def __init__(self):
         """Initialize Gemini client with Vertex AI."""
         try:
-            # Set GOOGLE_APPLICATION_CREDENTIALS env var for Vertex AI
-            # This ensures Vertex AI uses the service account file from .env
-            if settings.google_application_credentials:
-                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = (
-                    settings.google_application_credentials
-                )
+            # Set GOOGLE_APPLICATION_CREDENTIALS only for local development
+            # In Cloud Run, use the attached service account instead
+            if (settings.google_application_credentials and
+                    not settings.is_production):
+                creds = settings.google_application_credentials
+                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = creds
 
             # Initialize Vertex AI
             # In Cloud Run, this will automatically use the service account
@@ -108,7 +107,9 @@ class GeminiClient:
         try:
             # Use GCS URI if provided (more efficient)
             if gcs_uri:
-                logger.info(f"Using GCS URI for Vertex AI: {gcs_uri}")
+                logger.info(
+                    f"Using GCS URI for Vertex AI: {gcs_uri}"
+                )
                 image_part = Part.from_uri(
                     uri=gcs_uri,
                     mime_type="image/jpeg"

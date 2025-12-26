@@ -1,6 +1,5 @@
 """Application configuration management."""
 
-import os
 from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,7 +17,7 @@ class Settings(BaseSettings):
 
     # Google Sheets
     google_sheets_id: str
-    google_application_credentials: str = "./credentials/service_account.json"
+    google_application_credentials: Optional[str] = None
 
     # Google Cloud Storage
     gcs_bucket_name: Optional[str] = None
@@ -29,7 +28,8 @@ class Settings(BaseSettings):
     port: int = 8080
 
     # OCR Configuration
-    min_confidence_threshold: float = 0.5  # Reject extractions below 50% confidence
+    # Reject extractions below 50% confidence
+    min_confidence_threshold: float = 0.5
 
     # Webhook (for production)
     webhook_url: Optional[str] = None
