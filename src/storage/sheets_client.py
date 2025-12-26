@@ -114,28 +114,46 @@ class SheetsClient:
 
     def _get_next_no(self) -> int:
         """
-        Get the next sequential number by reading the entire No column.
-        Always reads from sheet to handle Cloud Run cold starts.
+        Get the next sequential number efficiently.
+        Uses row count to estimate last row, then reads only recent rows.
         """
         try:
             service = self._get_sheets_service()
-            # Read the entire A column (No column) - this is still fast
-            # Google Sheets API only returns rows with values, not empty rows
+
+            # Get sheet metadata to find row count (fast operation)
+            sheet_metadata = service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                ranges=[f"{self.SHEET_NAME}!A:A"],
+                fields="sheets.properties.gridProperties.rowCount"
+            ).execute()
+
+            sheets = sheet_metadata.get("sheets", [])
+            if not sheets:
+                return 1
+
+            row_count = sheets[0].get("properties", {}).get(
+                "gridProperties", {}
+            ).get("rowCount", 1)
+
+            if row_count <= 1:
+                logger.info("Sheet empty, starting from 1")
+                return 1
+
+            # Read only last 10 rows of column A (much faster than entire column)
+            start_row = max(2, row_count - 10)
             result = service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{self.SHEET_NAME}!A:A"
+                range=f"{self.SHEET_NAME}!A{start_row}:A{row_count}"
             ).execute()
 
             values = result.get("values", [])
 
-            # First row is header, so we need at least 2 rows
-            if len(values) <= 1:
-                logger.info("Only header row exists, starting from 1")
+            if not values:
                 return 1
 
-            # Find the maximum number from all rows (skip header at index 0)
+            # Find max from recent rows
             max_no = 0
-            for row in values[1:]:  # Skip header
+            for row in values:
                 if row and row[0]:
                     try:
                         num = int(row[0])
@@ -143,18 +161,13 @@ class SheetsClient:
                     except (ValueError, IndexError):
                         continue
 
-            # If no valid numbers found, start from 1
-            if max_no == 0:
-                logger.info("No valid numbers found in sheet, starting from 1")
-                return 1
-
-            next_no = max_no + 1
-            logger.info(f"Last No in sheet: {max_no}, next No will be: {next_no}")
+            next_no = max_no + 1 if max_no > 0 else 1
+            logger.info(f"Next No: {next_no}")
             return next_no
 
         except HttpError as e:
-            logger.error(f"Failed to get next No from sheet: {e}")
-            return 1  # Default to 1 on error
+            logger.error(f"Failed to get next No: {e}")
+            return 1
 
     @retry(
         stop=stop_after_attempt(3),
@@ -405,43 +418,33 @@ class SheetsClient:
     def _preprocess_image(self, image_path: str) -> bytes:
         """Preprocess image before upload to reduce size and token usage.
 
-        Args:
-            image_path: Path to the image file
-
-        Returns:
-            Preprocessed image as JPEG bytes
+        Uses fast BILINEAR resampling instead of slow LANCZOS.
+        Target: 800x800 max, JPEG quality 80.
         """
         try:
             img = Image.open(image_path)
 
-            # Auto-rotate based on EXIF orientation
-            try:
-                from PIL import ImageOps
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                pass
+            # Auto-rotate based on EXIF (fast operation)
+            from PIL import ImageOps
+            img = ImageOps.exif_transpose(img)
 
             # Convert to RGB if needed
             if img.mode != "RGB":
                 img = img.convert("RGB")
 
-            # Resize if too large (optimize for OCR and token usage)
-            # Receipts don't need full resolution - 800x800 is sufficient
+            # Fast resize using BILINEAR (much faster than LANCZOS)
             max_size = (800, 800)
             if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
-                img.thumbnail(max_size, Image.Resampling.LANCZOS)
-                logger.info(
-                    f"Resized image from original to {img.size} for upload"
-                )
+                img.thumbnail(max_size, Image.Resampling.BILINEAR)
+                logger.info(f"Resized to {img.size}")
 
-            # Convert to JPEG bytes
+            # Convert to JPEG bytes (quality 80, no optimize for speed)
             img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="JPEG", quality=85, optimize=True)
+            img.save(img_byte_arr, format="JPEG", quality=80)
             return img_byte_arr.getvalue()
 
         except Exception as e:
-            logger.warning(f"Image preprocessing failed, using original: {e}")
-            # Fall back to original file
+            logger.warning(f"Preprocessing failed: {e}")
             with open(image_path, 'rb') as f:
                 return f.read()
 
