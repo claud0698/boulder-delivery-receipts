@@ -170,19 +170,22 @@ class SheetsClient:
             return 1
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10)
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=5)
     )
     def append_delivery(self, delivery: DeliveryRecord) -> bool:
         """Append a single delivery record to the sheet."""
         try:
+            logger.info("Getting Sheets service...")
             service = self._get_sheets_service()
-            # Get the next sequential number
+
+            logger.info("Getting next row number...")
             next_no = self._get_next_no()
 
             row = delivery.to_sheets_row()
-            row[0] = str(next_no)  # Set the No value
+            row[0] = str(next_no)
 
+            logger.info(f"Appending row #{next_no} to Sheets...")
             service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"{self.SHEET_NAME}!A:O",
