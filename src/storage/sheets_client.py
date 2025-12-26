@@ -37,7 +37,7 @@ class SheetsClient:
             creds_path = settings.google_application_credentials
 
             # Try to use credentials file if it exists (local dev)
-            if os.path.isfile(creds_path):
+            if creds_path and os.path.isfile(creds_path):
                 self.credentials = service_account.Credentials.from_service_account_file(
                     creds_path,
                     scopes=self.SCOPES
